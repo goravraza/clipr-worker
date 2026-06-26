@@ -1,120 +1,247 @@
+// server.js — clipr-worker (fast: per-clip range download + parallel processing)
 import express from "express";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import path from "node:path";
-import crypto from "node:crypto";
+import crypto from "crypto";
+import { spawn } from "child_process";
+import { mkdtemp, rm, readFile, stat } from "fs/promises";
+import { tmpdir } from "os";
+import path from "path";
 
-const pexec = promisify(execFile);
 const app = express();
+const PORT = process.env.PORT || 10000;
+const SECRET =
+  process.env.CLIPPER_WORKER_SHARED_SECRET ||
+  process.env.WORKER_SHARED_SECRET ||
+  "";
 
-// Capture raw body so HMAC matches exactly what the app signed.
-app.use(express.json({
-  limit: "4mb",
-  verify: (req, _res, buf) => { req.rawBody = buf.toString("utf8"); },
-}));
+// Capture raw body for HMAC verification
+app.use(
+  express.json({
+    limit: "2mb",
+    verify: (req, _res, buf) => {
+      req.rawBody = buf.toString("utf8");
+    },
+  })
+);
 
-const SECRET = (process.env.CLIPPER_WORKER_SHARED_SECRET || process.env.WORKER_SHARED_SECRET || "").trim();
-
-function safeEq(a, b) {
-  const A = Buffer.from(a || ""), B = Buffer.from(b || "");
-  return A.length === B.length && crypto.timingSafeEqual(A, B);
+function verifySig(req) {
+  if (!SECRET) return true; // dev only
+  const sig =
+    req.get("x-signature") ||
+    req.get("x-shared-secret") ||
+    req.get("x-worker-secret") ||
+    (req.get("authorization") || "").replace(/^Bearer\s+/i, "");
+  if (!sig) return false;
+  // Accept either HMAC-sha256(rawBody) or raw shared secret
+  const hmac = crypto
+    .createHmac("sha256", SECRET)
+    .update(req.rawBody || "")
+    .digest("hex");
+  try {
+    if (
+      sig.length === hmac.length &&
+      crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(hmac))
+    )
+      return true;
+  } catch {}
+  try {
+    if (
+      sig.length === SECRET.length &&
+      crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(SECRET))
+    )
+      return true;
+  } catch {}
+  return false;
 }
 
-function authed(req) {
-  if (!SECRET) return true;
-  const sig = req.header("x-signature") || "";
-  const mac = crypto.createHmac("sha256", SECRET).update(req.rawBody || "").digest("hex");
-  if (safeEq(sig, mac)) return true;
-  const raw = (req.header("x-shared-secret") || req.header("x-worker-secret") || req.header("authorization") || "").replace(/^Bearer\s+/i, "");
-  return safeEq(raw, SECRET);
+function pexec(cmd, args, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], ...opts });
+    let out = "",
+      err = "";
+    p.stdout.on("data", (d) => (out += d.toString()));
+    p.stderr.on("data", (d) => (err += d.toString()));
+    p.on("error", reject);
+    p.on("close", (code) => {
+      if (code === 0) resolve({ out, err });
+      else reject(new Error(`${cmd} exited ${code}: ${err.slice(-500)}`));
+    });
+  });
 }
 
-app.get("/health", (_, res) => res.json({ ok: true }));
+function fmtTime(sec) {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = (sec % 60).toFixed(2);
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(5, "0")}`;
+}
+
+app.get("/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
 app.post("/render", async (req, res) => {
-  if (!authed(req)) return res.status(401).json({ error: "bad signature" });
-
-  const b = req.body || {};
-  const source_url = b.source_url || b.sourceUrl;
-  const upload = b.upload || {};
-  const uploadUrl = upload.url || upload.signed_upload_url || b.upload_url || b.signed_upload_url;
-  const callbackUrl = b.callback_url || b.callbackUrl || b.webhook_url || b.callback?.url;
-  const callbackSecret = b.callback_secret || b.callbackSecret || b.callback?.secret || SECRET;
-
-  // Accept either clips[] or a single top-level clip
-  let clips = Array.isArray(b.clips) ? b.clips : [];
-  if (clips.length === 0 && (b.clip_id || b.clipId)) {
-    clips = [{
-      id: b.clip_id || b.clipId,
-      start: b.start ?? b.start_time_seconds,
-      end: b.end ?? b.end_time_seconds,
-    }];
-  }
-  clips = clips.map(c => ({
-    id: c.id || c.clip_id || c.clipId,
-    start: Number(c.start ?? c.start_time_seconds),
-    end: Number(c.end ?? c.end_time_seconds),
-  }));
-
-  if (!source_url || !uploadUrl || clips.length === 0) {
-    return res.status(400).json({ error: "missing source_url, upload.url or clips" });
+  if (!verifySig(req)) {
+    console.warn("[render] bad signature");
+    return res.status(401).json({ error: "bad signature" });
   }
 
-  res.json({ accepted: true, count: clips.length });
+  const body = req.body || {};
+  const source_url = body.source_url || body.sourceUrl;
+  const upload = body.upload || {};
+  const uploadUrl =
+    upload.url ||
+    upload.signed_upload_url ||
+    body.upload_url ||
+    body.signed_upload_url;
+  const callback_url = body.callback_url || body.callbackUrl || body.webhook_url;
+  const callback_secret = body.callback_secret || SECRET;
+  const clipsInput = Array.isArray(body.clips)
+    ? body.clips
+    : body.clip_id
+      ? [body]
+      : [];
 
-  const dir = await mkdtemp(path.join(tmpdir(), "clipr-"));
-  const src = path.join(dir, "src.mp4");
-  const sendCallback = async (payload) => {
-    if (!callbackUrl) return;
-    const body = JSON.stringify(payload);
-    const sig = crypto.createHmac("sha256", callbackSecret).update(body).digest("hex");
-    await fetch(callbackUrl, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-signature": sig,
-        "x-worker-secret": callbackSecret,
-      },
-      body,
-    }).catch(() => {});
-  };
-
-  try {
-    await pexec("yt-dlp", ["-f", "mp4/bestvideo*+bestaudio/best", "--merge-output-format", "mp4", "-o", src, source_url], { maxBuffer: 1 << 26 });
-
-    for (const c of clips) {
-      const out = path.join(dir, `${c.id}.mp4`);
-      const dur = Math.max(1, c.end - c.start);
-      const vf = "crop=ih*9/16:ih,scale=1080:1920";
-      await pexec("ffmpeg", ["-y","-ss",String(c.start),"-i",src,"-t",String(dur),
-        "-vf",vf,"-c:v","libx264","-preset","veryfast","-crf","23","-c:a","aac","-b:a","128k",out]);
-
-      const buf = await readFile(out);
-      const putUrl = typeof uploadUrl === "string" ? uploadUrl : uploadUrl[c.id];
-      const putRes = await fetch(putUrl, {
-        method: "PUT",
-        headers: { "content-type": "video/mp4", ...(upload.headers || {}) },
-        body: buf,
-      });
-      if (!putRes.ok) throw new Error(`upload failed ${putRes.status}: ${(await putRes.text()).slice(0,200)}`);
-
-      await sendCallback({
-        status: "done",
-        clip_id: c.id,
-        storage_path: upload.path,
-      });
-    }
-  } catch (e) {
-    await sendCallback({
-      status: "error",
-      clip_id: clips[0]?.id,
-      error: String(e?.message || e).slice(0, 500),
-    });
-  } finally {
-    await rm(dir, { recursive: true, force: true });
+  if (!source_url || clipsInput.length === 0 || !uploadUrl) {
+    return res
+      .status(400)
+      .json({ error: "missing source_url, clips[] or upload.url" });
   }
+
+  // Respond immediately, process async
+  res.status(202).json({ accepted: true, count: clipsInput.length });
+
+  console.info(
+    `[render] accepted ${clipsInput.length} clip(s) from ${source_url.slice(0, 80)}`
+  );
+
+  // Process all clips in parallel
+  await Promise.all(
+    clipsInput.map((c) => processClip({ clip: c, source_url, uploadUrl, callback_url, callback_secret }))
+  );
 });
 
-app.listen(process.env.PORT || 10000, () => console.log("worker up"));
+async function processClip({ clip, source_url, uploadUrl, callback_url, callback_secret }) {
+  const jobId = clip.job_id || clip.jobId || clip.id;
+  const clipId = clip.clip_id || clip.clipId || clip.id;
+  const start = Number(clip.start ?? clip.start_time_seconds ?? 0);
+  const end = Number(clip.end ?? clip.end_time_seconds ?? start + 30);
+  const duration = Math.max(1, end - start);
+  const burnCaptions = !!clip.caption || !!clip.ass;
+
+  const dir = await mkdtemp(path.join(tmpdir(), `clip-${clipId}-`));
+  const src = path.join(dir, "src.mp4");
+  const out = path.join(dir, "out.mp4");
+  const started = Date.now();
+
+  try {
+    console.info(`[${clipId}] download range ${start}-${end}s`);
+    // yt-dlp: download ONLY the needed seconds (with small padding for keyframes)
+    const pad = 1.0;
+    const sectionStart = Math.max(0, start - pad);
+    const sectionEnd = end + pad;
+    await pexec("yt-dlp", [
+      "-f",
+      "mp4/bv*+ba/best",
+      "--download-sections",
+      `*${sectionStart}-${sectionEnd}`,
+      "--force-keyframes-at-cuts",
+      "-o",
+      src,
+      "--no-playlist",
+      "--no-warnings",
+      "-q",
+      source_url,
+    ]);
+
+    console.info(`[${clipId}] ffmpeg → 9:16 ${duration.toFixed(1)}s`);
+    // Vertical 9:16 crop, re-encode only when needed
+    const vf =
+      "crop=ih*9/16:ih,scale=1080:1920:flags=lanczos" +
+      (burnCaptions
+        ? `,drawtext=text='${String(clip.caption || "").replace(/'/g, "\\'")}':fontsize=64:fontcolor=white:borderw=4:bordercolor=black:x=(w-text_w)/2:y=h-th-160`
+        : "");
+
+    await pexec("ffmpeg", [
+      "-y",
+      "-ss",
+      String(pad),
+      "-i",
+      src,
+      "-t",
+      String(duration),
+      "-vf",
+      vf,
+      "-c:v",
+      "libx264",
+      "-preset",
+      "veryfast",
+      "-crf",
+      "23",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "128k",
+      "-movflags",
+      "+faststart",
+      out,
+    ]);
+
+    const buf = await readFile(out);
+    const size = (await stat(out)).size;
+    console.info(`[${clipId}] uploading ${(size / 1024 / 1024).toFixed(1)}MB`);
+
+    const up = await fetch(uploadUrl, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "video/mp4",
+        "x-upsert": "true",
+      },
+      body: buf,
+    });
+    if (!up.ok) {
+      const t = await up.text().catch(() => "");
+      throw new Error(`upload ${up.status}: ${t.slice(0, 200)}`);
+    }
+
+    const took = ((Date.now() - started) / 1000).toFixed(1);
+    console.info(`[${clipId}] done in ${took}s`);
+
+    if (callback_url) {
+      await sendCallback(callback_url, callback_secret, {
+        job_id: jobId,
+        clip_id: clipId,
+        status: "done",
+        duration_seconds: duration,
+      });
+    }
+  } catch (err) {
+    console.error(`[${clipId}] FAILED:`, err.message);
+    if (callback_url) {
+      await sendCallback(callback_url, callback_secret, {
+        job_id: jobId,
+        clip_id: clipId,
+        status: "error",
+        error: err.message.slice(0, 500),
+      }).catch(() => {});
+    }
+  } finally {
+    rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function sendCallback(url, secret, payload) {
+  const body = JSON.stringify(payload);
+  const sig = crypto.createHmac("sha256", secret).update(body).digest("hex");
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-signature": sig,
+      "x-worker-signature": sig,
+      "x-webhook-signature": sig,
+      "x-shared-secret": secret,
+    },
+    body,
+  });
+  console.info(`[callback] ${payload.clip_id} → ${res.status}`);
+}
+
+app.listen(PORT, () => console.log(`worker listening on ${PORT}`));
