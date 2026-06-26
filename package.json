@@ -2,5 +2,12 @@
   "name": "clipr-worker",
   "version": "1.0.0",
   "type": "module",
-  "dependencies": { "express": "^4.19.2" }
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "express": "^4.19.2"
+  }
 }
