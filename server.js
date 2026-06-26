@@ -62,21 +62,36 @@ function run(cmd, args, label) {
 async function downloadSegment({ sourceUrl, start, end, outTemplate, label }) {
   const cookies = ensureCookies();
   const section = `*${Math.max(0, start - 1)}-${end + 1}`;
-  const args = [
-    "--no-playlist",
-    "--no-warnings",
-    "--force-overwrites",
-    "--download-sections", section,
-    "-f", "bv*+ba/b",
-    "-S", "res:1080,fps,br",
-    "--merge-output-format", "mp4",
-    "-o", outTemplate,
-  ];
-  if (cookies) args.push("--cookies", cookies);
-  args.push(sourceUrl);
-  await run("yt-dlp", args, label);
-}
+const sourceTemplate = path.join(tmpDir, "source.%(ext)s");
 
+await run("yt-dlp", [
+  "--no-playlist",
+  "--force-overwrites",
+  "--no-check-formats",
+
+  // Download only the clip section
+  "--download-sections",
+  `*${start}-${end}`,
+
+  // IMPORTANT: do NOT force mp4-only YouTube formats
+  "-f",
+  "bv*+ba/b",
+
+  // Prefer 720p/1080p but accept whatever exists
+  "-S",
+  "res:720,fps,br",
+
+  // Let yt-dlp merge to a normal container if needed
+  "--merge-output-format",
+  "mkv",
+
+  "-o",
+  sourceTemplate,
+
+  ...(cookiesPath ? ["--cookies", cookiesPath] : []),
+
+  sourceUrl,
+], `download ${clip.id}`);
 async function ffmpegCrop916({ inFile, outFile, start, end, label }) {
   const duration = Math.max(1, end - start);
   const vf =
