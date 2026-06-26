@@ -105,8 +105,7 @@ async function ytdlpDownload({ sourceUrl, start, end, outPath }) {
 
   "--force-keyframes-at-cuts",
 
-  "-o",
-  sourcePath,
+ "-o", srcFile,   // ✅ use srcFile here
 ];
 
 if (cookiesPath) {
