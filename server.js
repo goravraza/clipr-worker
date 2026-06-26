@@ -8,9 +8,28 @@ import os from "os";
 import { createClient } from "@supabase/supabase-js";
 
 const PORT = process.env.PORT || 10000;
-const SECRET = (process.env.WORKER_SHARED_SECRET || "").trim();
+const SHARED_SECRET = process.env.WORKER_SHARED_SECRET || process.env.CLIPPER_WORKER_SHARED_SECRET || "";
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const STORAGE_BUCKET = process.env.STORAGE_BUCKET || "clips";
 const COOKIES_SRC = "/etc/secrets/youtube-cookies.txt";
 const COOKIES_DST = "/tmp/youtube-cookies.txt";
+
+function ensureWritableCookies() {
+  try {
+    if (fs.existsSync(COOKIES_SRC)) {
+      fs.copyFileSync(COOKIES_SRC, COOKIES_DST);
+      return COOKIES_DST;
+    }
+  } catch (e) {
+    console.error("cookie copy failed:", e.message);
+  }
+  return null;
+}
+
+const supabase = SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } })
+  : null;
 
 const app = express();
 app.use(express.json({
@@ -18,199 +37,159 @@ app.use(express.json({
   verify: (req, _res, buf) => { req.rawBody = buf.toString("utf8"); },
 }));
 
-function authOk(req) {
-  if (!SECRET) return false;
-  const hdr =
-    req.headers["x-shared-secret"] ||
-    req.headers["x-worker-secret"] ||
-    (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
-  if (hdr && hdr === SECRET) return true;
-  const sig = req.headers["x-signature"];
-  if (sig && req.rawBody) {
-    const expected = crypto.createHmac("sha256", SECRET).update(req.rawBody).digest("hex");
-    try {
-      if (crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return true;
-    } catch {}
-  }
-  return false;
-}
-
-function ensureCookies() {
+function verifyAuth(req) {
+  const header = req.headers["x-worker-signature"] || req.headers["authorization"] || "";
+  const token = String(header).replace(/^Bearer\s+/i, "").trim();
+  if (!SHARED_SECRET) return false;
+  if (token === SHARED_SECRET) return true;
   try {
-    if (fs.existsSync(COOKIES_SRC)) {
-      fs.copyFileSync(COOKIES_SRC, COOKIES_DST);
-      return COOKIES_DST;
-    }
-  } catch (e) {
-    console.warn("cookie copy failed:", e.message);
-  }
-  return null;
+    const expected = crypto.createHmac("sha256", SHARED_SECRET).update(req.rawBody || "").digest("hex");
+    return token.length === expected.length && crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expected));
+  } catch { return false; }
 }
 
-function run(cmd, args, label) {
+function run(cmd, args, opts = {}) {
   return new Promise((resolve, reject) => {
-    console.log(`[${label}] ${cmd} ${args.join(" ")}`);
-    const p = spawn(cmd, args);
+    console.log(`+ ${cmd} ${args.join(" ")}`);
+    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], ...opts });
     let stderr = "";
-    p.stdout.on("data", (d) => process.stdout.write(`[${label}] ${d}`));
-    p.stderr.on("data", (d) => { stderr += d.toString(); process.stderr.write(`[${label}] ${d}`); });
+    p.stdout.on("data", (d) => process.stdout.write(d));
+    p.stderr.on("data", (d) => { stderr += d.toString(); process.stderr.write(d); });
     p.on("error", reject);
-    p.on("close", (code) => code === 0 ? resolve() : reject(new Error(`${label} exit ${code}: ${stderr.slice(-400)}`)));
+    p.on("close", (code) => code === 0 ? resolve() : reject(new Error(`${cmd} exit ${code}: ${stderr.slice(-500)}`)));
   });
 }
 
-async function downloadSegment({ sourceUrl, start, end, outTemplate, label }) {
-  const cookies = ensureCookies();
-  const section = `*${Math.max(0, start - 1)}-${end + 1}`;
-const sourceTemplate = path.join(tmpDir, "source.%(ext)s");
+function fmtTime(sec) {
+  const s = Math.max(0, Number(sec) || 0);
+  const hh = String(Math.floor(s / 3600)).padStart(2, "0");
+  const mm = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
+  const ss = String(Math.floor(s % 60)).padStart(2, "0");
+  return `${hh}:${mm}:${ss}`;
+}
 
-await run("yt-dlp", [
-  "--no-playlist",
-  "--force-overwrites",
-  "--no-check-formats",
-
-  // Download only the clip section
-  "--download-sections",
-  `*${start}-${end}`,
-
-  // IMPORTANT: do NOT force mp4-only YouTube formats
-  "-f",
-  "bv*+ba/b",
-
-  // Prefer 720p/1080p but accept whatever exists
-  "-S",
-  "res:720,fps,br",
-
-  // Let yt-dlp merge to a normal container if needed
-  "--merge-output-format",
-  "mkv",
-
-  "-o",
-  sourceTemplate,
-
-  ...(cookiesPath ? ["--cookies", cookiesPath] : []),
-
-  sourceUrl,
-], `download ${clip.id}`);
-async function ffmpegCrop916({ inFile, outFile, start, end, label }) {
-  const duration = Math.max(1, end - start);
-  const vf =
-    "[0:v]split=2[bg][fg];" +
-    "[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=40:1[bgb];" +
-    "[fg]scale=1080:-2[fgs];" +
-    "[bgb][fgs]overlay=(W-w)/2:(H-h)/2";
+async function ffmpegCrop916(input, output, clip) {
+  const duration = Math.max(1, (clip.end_time_seconds || 0) - (clip.start_time_seconds || 0));
+  const vf = "[0:v]split=2[bg][fg];[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:1[bgb];[fg]scale=1080:-2[fgs];[bgb][fgs]overlay=(W-w)/2:(H-h)/2,setsar=1";
   await run("ffmpeg", [
-    "-y",
-    "-ss", String(start),
-    "-i", inFile,
-    "-t", String(duration),
+    "-y", "-i", input, "-t", String(duration),
     "-filter_complex", vf,
     "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
     "-c:a", "aac", "-b:a", "128k",
     "-movflags", "+faststart",
-    outFile,
-  ], label);
+    output,
+  ]);
 }
 
-async function uploadToSignedUrl(signedUrl, filePath) {
-  const buf = await fsp.readFile(filePath);
-  const r = await fetch(signedUrl, {
-    method: "PUT",
-    headers: { "Content-Type": "video/mp4", "x-upsert": "true" },
-    body: buf,
+async function uploadToStorage(localPath, key) {
+  if (!supabase) throw new Error("supabase not configured");
+  const data = await fsp.readFile(localPath);
+  const { error } = await supabase.storage.from(STORAGE_BUCKET).upload(key, data, {
+    contentType: "video/mp4", upsert: true,
   });
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    throw new Error(`upload ${r.status}: ${t.slice(0, 200)}`);
-  }
+  if (error) throw new Error(`upload: ${error.message}`);
+  const { data: pub } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(key);
+  return pub.publicUrl;
 }
 
-async function callback({ url, secret, payload }) {
-  if (!url) return;
+async function postCallback(callbackUrl, callbackSecret, payload) {
+  if (!callbackUrl) return;
+  const body = JSON.stringify(payload);
+  const sig = crypto.createHmac("sha256", callbackSecret || SHARED_SECRET).update(body).digest("hex");
   try {
-    await fetch(url, {
+    const r = await fetch(callbackUrl, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-worker-secret": secret || "",
-      },
-      body: JSON.stringify(payload),
+      headers: { "content-type": "application/json", "x-worker-signature": sig },
+      body,
     });
+    console.log(`callback ${callbackUrl} -> ${r.status}`);
   } catch (e) {
-    console.warn("callback failed:", e.message);
+    console.error("callback error:", e.message);
   }
 }
 
 async function processClip({ clip, sourceUrl, upload, callbackUrl, callbackSecret }) {
-  const id = clip.clip_id || clip.clipId || clip.id;
-  const start = Number(clip.start ?? clip.start_time_seconds ?? 0);
-  const end = Number(clip.end ?? clip.end_time_seconds ?? start + 30);
-  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), `clip-${id}-`));
-  const sourceTemplate = path.join(tmpDir, "src.%(ext)s");
-  const finalPath = path.join(tmpDir, "out.mp4");
-  const label = `clip ${id}`;
+  const clipId = clip.id || crypto.randomUUID();
+  let tmpDir;
   try {
-    await downloadSegment({ sourceUrl, start, end, outTemplate: sourceTemplate, label });
+    tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), `clip-${clipId}-`));
+    const sourceTemplate = path.join(tmpDir, "source.%(ext)s");
+    const finalPath = path.join(tmpDir, "final.mp4");
+    const cookiesPath = ensureWritableCookies();
+
+    const start = Math.max(0, Number(clip.start_time_seconds) || 0);
+    const end = Math.max(start + 1, Number(clip.end_time_seconds) || start + 30);
+    const section = `*${fmtTime(start)}-${fmtTime(end)}`;
+
+    const ytArgs = [
+      "--no-playlist",
+      "--force-overwrites",
+      "--no-check-formats",
+      "--download-sections", section,
+      "-f", "bv*+ba/b",
+      "-S", "res:1080,fps,br",
+      "--merge-output-format", "mp4",
+      "-o", sourceTemplate,
+    ];
+    if (cookiesPath) ytArgs.push("--cookies", cookiesPath);
+    ytArgs.push(sourceUrl);
+
+    await run("yt-dlp", ytArgs);
+
     const files = await fsp.readdir(tmpDir);
-    const srcFile = files.find((f) => f.startsWith("src."));
-    if (!srcFile) throw new Error("downloaded source file missing");
-    const sourcePath = path.join(tmpDir, srcFile);
-    await ffmpegCrop916({ inFile: sourcePath, outFile: finalPath, start: 0, end: end - start, label });
+    const srcFile = files.map((f) => path.join(tmpDir, f)).find((f) => /source\.(mp4|mkv|webm|m4a|mov)$/i.test(f));
+    if (!srcFile) throw new Error(`yt-dlp produced no source file in ${tmpDir}: ${files.join(",")}`);
+
+    // If yt-dlp downloaded section starting at 'start', reset start offset for ffmpeg
+    const clipForCut = { ...clip, start_time_seconds: 0, end_time_seconds: end - start };
+    await ffmpegCrop916(srcFile, finalPath, clipForCut);
+
+    let publicUrl = null;
     if (upload?.url) {
-      await uploadToSignedUrl(upload.url, finalPath);
+      const data = await fsp.readFile(finalPath);
+      const put = await fetch(upload.url, {
+        method: upload.method || "PUT",
+        headers: upload.headers || { "content-type": "video/mp4" },
+        body: data,
+      });
+      if (!put.ok) throw new Error(`upload PUT ${put.status}`);
+      publicUrl = upload.public_url || null;
+    } else {
+      const key = `renders/${clipId}.mp4`;
+      publicUrl = await uploadToStorage(finalPath, key);
     }
-    await callback({
-      url: callbackUrl,
-      secret: callbackSecret,
-      payload: {
-        status: "done",
-        clip_id: id,
-        storage_path: upload?.path,
-        output_url: null,
-      },
+
+    await postCallback(callbackUrl, callbackSecret, {
+      clip_id: clipId, status: "completed", storage_url_mp4: publicUrl,
     });
-    console.log(`[${label}] done`);
+    console.log(`[clip ${clipId}] done`);
   } catch (e) {
-    console.error(`[${label}] error:`, e.message);
-    await callback({
-      url: callbackUrl,
-      secret: callbackSecret,
-      payload: { status: "error", clip_id: id, error: e.message.slice(0, 500) },
+    console.error(`[clip ${clipId}] error:`, e.message);
+    await postCallback(callbackUrl, callbackSecret, {
+      clip_id: clipId, status: "failed", error: e.message,
     });
   } finally {
-    fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    if (tmpDir) { try { await fsp.rm(tmpDir, { recursive: true, force: true }); } catch {} }
   }
 }
 
-app.get("/health", (req, res) => {
-  if (!authOk(req)) return res.status(401).json({ error: "unauthorized" });
-  res.json({ ok: true });
+app.get("/health", (_req, res) => res.json({ ok: true, cookies: fs.existsSync(COOKIES_SRC) }));
+
+app.post("/render", (req, res) => {
+  if (!verifyAuth(req)) return res.status(401).json({ error: "unauthorized" });
+  const { source_url, sourceUrl, upload, callback_url, callbackUrl, callback_secret, callbackSecret, clips, clip } = req.body || {};
+  const src = source_url || sourceUrl;
+  const cbUrl = callback_url || callbackUrl;
+  const cbSecret = callback_secret || callbackSecret;
+  const list = Array.isArray(clips) ? clips : (clip ? [clip] : []);
+  if (!src) return res.status(400).json({ error: "missing source_url" });
+  if (!list.length) return res.status(400).json({ error: "missing clips" });
+
+  res.status(202).json({ accepted: true, count: list.length });
+
+  Promise.all(list.map((c) => processClip({
+    clip: c, sourceUrl: src, upload, callbackUrl: cbUrl, callbackSecret: cbSecret,
+  }))).catch((e) => console.error("batch error:", e.message));
 });
 
-app.post("/render", async (req, res) => {
-  if (!authOk(req)) return res.status(401).json({ error: "unauthorized" });
-  const body = req.body || {};
-  const sourceUrl = body.source_url || body.sourceUrl;
-  const upload = body.upload || (body.upload_url ? { url: body.upload_url, path: body.storage_path } : null);
-  const callbackUrl = body.callback_url || body.callbackUrl || body.webhook_url;
-  const callbackSecret = body.callback_secret || body.callbackSecret || SECRET;
-
-  let clips = Array.isArray(body.clips) && body.clips.length
-    ? body.clips
-    : (body.clip_id || body.clipId || body.id)
-      ? [{ clip_id: body.clip_id || body.clipId || body.id, start: body.start, end: body.end,
-           start_time_seconds: body.start_time_seconds, end_time_seconds: body.end_time_seconds }]
-      : [];
-
-  if (!sourceUrl) return res.status(400).json({ error: "missing source_url" });
-  if (!upload?.url) return res.status(400).json({ error: "missing upload.url" });
-  if (!clips.length) return res.status(400).json({ error: "missing clips" });
-
-  res.status(202).json({ accepted: true, count: clips.length });
-
-  Promise.all(clips.map((clip) =>
-    processClip({ clip, sourceUrl, upload, callbackUrl, callbackSecret })
-  )).catch((e) => console.error("batch error:", e.message));
-});
-
-app.listen(PORT, () => console.log(`worker listening on ${PORT}, cookies=${fs.existsSync(COOKIES_SRC) ? "yes" : "no"}`));
+app.listen(PORT, () => console.log(`worker on :${PORT}, cookies=${fs.existsSync(COOKIES_SRC) ? "yes" : "no"}`));
