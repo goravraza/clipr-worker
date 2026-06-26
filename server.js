@@ -16,12 +16,28 @@ const SECRET =
   process.env.CLIPPER_WORKER_SHARED_SECRET ||
   process.env.WORKER_SHARED_SECRET ||
   "";
-const COOKIES_PATH = fs.existsSync("/etc/secrets/youtube-cookies.txt")
-  ? "/etc/secrets/youtube-cookies.txt"
-  : (fs.existsSync("/etc/secrets/cookies.txt") ? "/etc/secrets/cookies.txt" : null);
+
+const SECRET_COOKIES_PATH =
+  process.env.YOUTUBE_COOKIES_PATH || "/etc/secrets/youtube-cookies.txt";
+const RUNTIME_COOKIES_PATH = "/tmp/youtube-cookies.txt";
+
+function getWritableCookiesPath() {
+  if (!fs.existsSync(SECRET_COOKIES_PATH)) {
+    return null;
+  }
+  try {
+    fs.copyFileSync(SECRET_COOKIES_PATH, RUNTIME_COOKIES_PATH);
+    fs.chmodSync(RUNTIME_COOKIES_PATH, 0o600);
+    return RUNTIME_COOKIES_PATH;
+  } catch (error) {
+    console.error("[boot] failed to copy cookies to /tmp", error);
+    return null;
+  }
+}
 
 console.log("[boot] secret configured:", SECRET ? "yes" : "NO");
-console.log("[boot] cookies file:", COOKIES_PATH || "NONE (YouTube will block)");
+console.log("[boot] cookies secret file:", SECRET_COOKIES_PATH);
+console.log("[boot] cookies runtime file:", getWritableCookiesPath() || "not found");
 
 function verifySig(req) {
   if (!SECRET) return true;
@@ -48,7 +64,7 @@ function run(cmd, args, opts = {}) {
   });
 }
 
-app.get("/health", (_req, res) => res.json({ ok: true, cookies: !!COOKIES_PATH }));
+app.get("/health", (_req, res) => res.json({ ok: true, cookies: !!getWritableCookiesPath() }));
 
 app.post("/render", async (req, res) => {
   if (!verifySig(req)) {
@@ -71,7 +87,6 @@ app.post("/render", async (req, res) => {
   console.log(`[render] accepted ${clips.length} clip(s) from ${sourceUrl}`);
   res.status(202).json({ accepted: true, count: clips.length });
 
-  // process in background
   processClips({ sourceUrl, clips, uploadUrl, storagePath, callbackUrl, body })
     .catch(err => console.error("[render] fatal", err));
 });
@@ -91,22 +106,23 @@ async function processOne({ sourceUrl, clip, idx, uploadUrl, storagePath, callba
   const t0 = Date.now();
 
   try {
-    // 1. Download ONLY the clip range
-    const ytArgs = [
+    const cookiesPath = getWritableCookiesPath();
+    const ytdlpArgs = [
       "--no-warnings",
       "--no-playlist",
-      "-f", "bv*[height<=1080]+ba/b[height<=1080]/best",
+      "--no-cache-dir",
+      "-f", "bv*+ba/best",
+      "-S", "res:1080,ext:mp4:m4a",
       "--merge-output-format", "mp4",
       "--download-sections", `*${start}-${end}`,
       "--force-keyframes-at-cuts",
       "-o", srcFile,
     ];
-    if (COOKIES_PATH) ytArgs.push("--cookies", COOKIES_PATH);
-    ytArgs.push(sourceUrl);
+    if (cookiesPath) ytdlpArgs.push("--cookies", cookiesPath);
+    ytdlpArgs.push(sourceUrl);
 
-    await run("yt-dlp", ytArgs);
+    await run("yt-dlp", ytdlpArgs);
 
-    // 2. Crop to 9:16 + re-encode fast
     await run("ffmpeg", [
       "-y",
       "-i", srcFile,
@@ -118,7 +134,6 @@ async function processOne({ sourceUrl, clip, idx, uploadUrl, storagePath, callba
       outFile,
     ]);
 
-    // 3. Upload
     const buf = fs.readFileSync(outFile);
     const finalPath = (storagePath || `clips/${clipId}.mp4`).replace(/^clips\//, "");
 
@@ -129,12 +144,6 @@ async function processOne({ sourceUrl, clip, idx, uploadUrl, storagePath, callba
         body: buf,
       });
       if (!r.ok) throw new Error(`upload failed ${r.status}: ${await r.text()}`);
-    } else if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
-      const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
-      const { error } = await sb.storage.from("clips").upload(finalPath, buf, {
-        contentType: "video/mp4", upsert: true,
-      });
-      if (error) throw error;
     } else {
       throw new Error("no upload destination");
     }
