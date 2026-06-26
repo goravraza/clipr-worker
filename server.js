@@ -112,7 +112,7 @@ async function processOne({ sourceUrl, clip, idx, uploadUrl, storagePath, callba
       "--no-playlist",
       "--no-cache-dir",
       "-f", "bv*+ba/best",
-      "-S", "res:1080,ext:mp4:m4a",
+      "-S", "res:<=1080,ext:mp4:m4a",
       "--merge-output-format", "mp4",
       "--download-sections", `*${start}-${end}`,
       "--force-keyframes-at-cuts",
