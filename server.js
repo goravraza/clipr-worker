@@ -8,10 +8,7 @@ import path from "path";
 import os from "os";
 
 const PORT = process.env.PORT || 10000;
-const SECRET =
-  process.env.CLIPPER_WORKER_SHARED_SECRET ||
-  process.env.WORKER_SHARED_SECRET ||
-  "";
+const SHARED_SECRET = (process.env.WORKER_SHARED_SECRET || "").trim();
 
 const SECRET_COOKIES_PATH =
   process.env.YOUTUBE_COOKIES_PATH || "/etc/secrets/youtube-cookies.txt";
