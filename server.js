@@ -92,7 +92,7 @@ async function processClip(clip, common) {
 
   const workDir = path.join(os.tmpdir(), `clip-${clipId}`);
   await mkdir(workDir, { recursive: true });
-  const sourcePath = path.join(workDir, "src.mkv"); // yt-dlp may output mkv/webm/mp4
+  const sourcePath = path.join(workDir, "src.mp4");
   const finalPath = path.join(workDir, "out.mp4");
 
   try {
@@ -103,14 +103,14 @@ async function processClip(clip, common) {
       "--no-warnings",
       "--no-playlist",
       "--no-cache-dir",
-
-      // Safer fallback: don’t force MP4, let yt-dlp pick
-      "-f", "bv*+ba/b",
-      "-S", "res:720,fps,br",
-      "--merge-output-format", "mkv",
-
+      "-f", "bestvideo*+bestaudio/best",
+      "-S", "res:1080,ext:mp4:m4a",
+      "--merge-output-format", "mp4",
       "--download-sections", `*${start}-${end}`,
       "--force-keyframes-at-cuts",
+      "--user-agent",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "--extractor-args", "youtube:player_client=web,android",
       "-o", sourcePath,
     ];
     if (cookiesPath) ytdlpArgs.push("--cookies", cookiesPath);
@@ -227,4 +227,14 @@ app.post("/render", async (req, res) => {
   res.status(202).json({ accepted: true, count: clips.length });
 
   // Process in background (parallel)
-  Promise.all(clips.map((c) =>
+  Promise.all(clips.map((c) => processClip(c, common))).catch((err) =>
+    console.error("[render] batch error:", err),
+  );
+});
+
+app.listen(PORT, () => {
+  console.log(`[boot] worker listening on ${PORT}`);
+  console.log(`[boot] tmp=${os.tmpdir()} secret_len=${SHARED_SECRET.length}`);
+  console.log(`[boot] cookies secret: ${SECRET_COOKIES_PATH}`);
+  console.log(`[boot] cookies runtime: ${getWritableCookiesPath() || "not found"}`);
+});
