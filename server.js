@@ -84,19 +84,37 @@ async function ytdlpDownload({ sourceUrl, start, end, outPath }) {
   // Pad 1s on each side so keyframes align cleanly.
   const padStart = Math.max(0, Number(start) - 1);
   const padEnd = Number(end) + 1;
-  const args = [
-    "--no-warnings", "--no-playlist", "--no-cache-dir",
-    "-f", "bv*+ba/best",
-    "-S", "res:1080,ext:mp4:m4a",
-    "--merge-output-format", "mp4",
-    "--download-sections", `*${padStart}-${padEnd}`,
-    "--force-keyframes-at-cuts",
-    "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "--extractor-args", "youtube:player_client=web,android",
-    "-o", outPath,
-  ];
-  if (COOKIES_PATH) args.push("--cookies", COOKIES_PATH);
-  args.push(sourceUrl);
+ const ytdlpArgs = [
+  "--no-warnings",
+  "--no-playlist",
+  "--no-cache-dir",
+
+  // Important: avoid strict unavailable formats
+  "-f",
+  "bestvideo*+bestaudio/best",
+
+  // Prefer mp4/1080p, but allow fallback if unavailable
+  "-S",
+  "res:1080,ext:mp4:m4a",
+
+  "--merge-output-format",
+  "mp4",
+
+  "--download-sections",
+  `*${start}-${end}`,
+
+  "--force-keyframes-at-cuts",
+
+  "-o",
+  sourcePath,
+];
+
+if (cookiesPath) {
+  ytdlpArgs.push("--cookies", cookiesPath);
+}
+
+ytdlpArgs.push(sourceUrl);
+
   await run("yt-dlp", args, { timeoutMs: 12 * 60 * 1000 });
 }
 
