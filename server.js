@@ -99,22 +99,42 @@ async function processClip(clip, common) {
     console.log(`[clip ${clipId}] download ${start}-${end}`);
 
     const cookiesPath = getWritableCookiesPath();
-    const ytdlpArgs = [
-      "--no-warnings",
-      "--no-playlist",
-      "--no-cache-dir",
-      "-f", "bestvideo*+bestaudio/best",
-      "-S", "res:1080,ext:mp4:m4a",
-      "--merge-output-format", "mp4",
-      "--download-sections", `*${start}-${end}`,
-      "--force-keyframes-at-cuts",
-      "--user-agent",
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      "--extractor-args", "youtube:player_client=web,android",
-      "-o", sourcePath,
-    ];
-    if (cookiesPath) ytdlpArgs.push("--cookies", cookiesPath);
-    ytdlpArgs.push(sourceUrl);
+    const sourceTemplate = path.join(tmpDir, `${clipId}.%(ext)s`);
+
+const args = [
+  "--no-playlist",
+  "--force-overwrites",
+  "--no-warnings",
+
+  // IMPORTANT: broad fallback, avoids "Requested format is not available"
+  "-f", "bv*+ba/b",
+  "-S", "res:720,fps,br",
+  "--merge-output-format", "mkv",
+
+  "--download-sections", `*${start}-${end}`,
+  "-o", sourceTemplate,
+];
+
+if (cookiesPath) {
+  args.push("--cookies", cookiesPath);
+}
+
+args.push(sourceUrl);
+
+await run("yt-dlp", args);
+
+// Find actual downloaded file because extension may be mp4/webm/mkv
+const downloaded = fs
+  .readdirSync(tmpDir)
+  .map((name) => path.join(tmpDir, name))
+  .find((file) => file.includes(clipId) && !file.endsWith(".part"));
+
+if (!downloaded) {
+  throw new Error(`yt-dlp finished but no downloaded source file found for ${clipId}`);
+}
+
+// Then pass `downloaded` into FFmpeg
+await ffmpegCrop916(downloaded, finalPath);
 
     await runCmd("yt-dlp", ytdlpArgs, `clip ${clipId}`);
 
