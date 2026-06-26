@@ -4,7 +4,6 @@ import { spawn } from "child_process";
 import fs from "fs";
 import path from "path";
 import os from "os";
-import { createClient } from "@supabase/supabase-js";
 
 const app = express();
 app.use(express.json({
